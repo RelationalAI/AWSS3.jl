@@ -543,6 +543,79 @@ function s3_list_objects(aws::AWSConfig, bucket, path_prefix=""; delimiter="/", 
     end
 end
 
+function unroll_common_prefix(ch, cp)
+    if cp isa Pair
+        put!(ch, cp)
+    else
+        for obj in cp
+            unroll_common_prefix(ch, obj)
+        end
+    end
+
+    return nothing
+end
+
+"""
+    s3_list_common_prefixes([::AWSConfig], bucket, [path_prefix]; delimiter="/", max_items=1000)
+
+Uses [List Objects](http://docs.aws.amazon.com/AmazonS3/latest/API/RESTBucketGET.html)
+in `bucket` with optional `path_prefix`, returning only common prefixes.
+
+Returns an iterator of common prefixes.
+"""
+function s3_list_common_prefixes(aws::AWSConfig, bucket, path_prefix=""; delimiter="/", max_items=nothing)
+    return Channel() do chnl
+        more = true
+        num_objects = 0
+        marker = ""
+
+        while more
+            q = Dict{String, String}()
+            if path_prefix != ""
+                q["prefix"] = path_prefix
+            end
+            if delimiter != ""
+                q["delimiter"] = delimiter
+            end
+            if marker != ""
+                q["marker"] = marker
+            end
+            if max_items !== nothing
+                # Note: AWS seems to only return up to 1000 items
+                q["max-keys"] = string(max_items - num_objects)
+            end
+
+            @repeat 4 try
+                # Request objects
+                r = s3(aws, "GET", bucket; query = q)
+
+                if haskey(r, "CommonPrefixes")
+                    unroll_common_prefix(chnl, r["CommonPrefixes"])
+                end
+
+                # Add each object from the response and update our object count / marker
+                if haskey(r, "Contents")
+                    l = isa(r["Contents"], Vector) ? r["Contents"] : [r["Contents"]]
+                    for object in l
+                        num_objects += 1
+                        marker = object["Key"]
+                    end
+                # It's possible that the response doesn't have "Contents" and just has a prefix,
+                # in which case we should just save the next marker and iterate.
+                elseif haskey(r, "Prefix")
+                    num_objects +=1
+                    marker = haskey(r, "NextMarker") ? r["NextMarker"] : r["Prefix"]
+                end
+
+                # Continue looping if the results were truncated and we haven't exceeded out max_items (if specified)
+                more = r["IsTruncated"] == "true" && (max_items === nothing || num_objects < max_items)
+            catch e
+                @delay_retry if ecode(e) in ["NoSuchBucket"] end
+            end
+        end
+    end
+end
+
 s3_list_objects(a...) = s3_list_objects(default_aws_config(), a...)
 
 
